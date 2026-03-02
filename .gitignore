@@ -1,0 +1,12 @@
+/target/
+**/*.rs.bk
+
+# Media and DB cache
+/covers/
+library.db
+*.db
+*.db-shm
+*.db-wal
+
+# Environment variables
+.env

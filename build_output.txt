@@ -1,0 +1,2 @@
+   Compiling stream-api v0.1.0 (D:\Code\Rust\stream-api)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.30s
