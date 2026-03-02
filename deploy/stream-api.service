@@ -4,23 +4,16 @@ After=network.target
 
 [Service]
 Type=simple
-User=streamapi
-Group=streamapi
+User=root
+Group=www-data
 WorkingDirectory=/opt/stream-api
 ExecStart=/opt/stream-api/stream-api
+
 EnvironmentFile=/opt/stream-api/.env
-Restart=on-failure
+
+Restart=always
 RestartSec=5
 LimitNOFILE=65536
-
-StandardOutput=journal
-StandardError=journal
-
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/stream-api /var/lib/stream-api
-NoNewPrivileges=true
-PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
