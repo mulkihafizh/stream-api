@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-Group=www-data
+Group=root
 WorkingDirectory=/opt/stream-api
 ExecStart=/opt/stream-api/stream-api
 
