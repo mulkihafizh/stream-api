@@ -19,6 +19,7 @@ log = "0.4"
 env_logger = "0.11"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
+chrono = "0.4.44"
 
 [profile.release]
 opt-level = 3

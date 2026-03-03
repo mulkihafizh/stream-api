@@ -59,6 +59,8 @@ async fn main() -> std::io::Result<()> {
                         "/playlists/{id}/tracks",
                         web::post().to(handlers::add_track_to_playlist),
                     )
+                    .route("/history", web::post().to(handlers::record_play))
+                    .route("/stats/{year}", web::get().to(handlers::get_annual_stats))
                     .route("/stream/{path:.*}", web::get().to(handlers::stream_file))
                     .route("/covers/{filename:.*}", web::get().to(handlers::serve_cover)),
             )

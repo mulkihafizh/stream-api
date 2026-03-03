@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::db;
 use crate::models::{
     AddTrackRequest, CreatePlaylistRequest, LibraryResponse, Playlist, PlaylistsResponse,
+    RecordPlayRequest,
 };
 use actix_files::NamedFile;
 use actix_web::{web, HttpRequest, HttpResponse};
@@ -165,3 +166,65 @@ pub async fn serve_cover(
     let file = NamedFile::open(cover_path)?;
     Ok(file.into_response(&req))
 }
+
+pub async fn record_play(
+    db_handle: web::Data<Mutex<Connection>>,
+    body: web::Json<RecordPlayRequest>,
+) -> HttpResponse {
+    let track_id = body.track_id.clone();
+    let duration = body.duration_listened;
+
+    let result = web::block(move || {
+        let conn = db_handle.lock().unwrap();
+        db::record_play(&conn, &track_id, duration)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => HttpResponse::Created().json(serde_json::json!({
+            "status": "recorded"
+        })),
+        Ok(Err(e)) => {
+            log::error!("Database error recording play: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to record play history"
+            }))
+        }
+        Err(e) => {
+            log::error!("Blocking error recording play: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Internal server error"
+            }))
+        }
+}
+
+pub async fn get_annual_stats(
+    db_handle: web::Data<Mutex<Connection>>,
+    path: web::Path<i32>,
+) -> HttpResponse {
+    let year = path.into_inner();
+    let db_handle = db_handle.clone();
+
+    let result = web::block(move || {
+        let conn = db_handle.lock().unwrap();
+        db::get_annual_stats(&conn, year)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(stats)) => HttpResponse::Ok().json(stats),
+        Ok(Err(e)) => {
+            log::error!("Database error fetching stats: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to fetch annual statistics"
+            }))
+        }
+        Err(e) => {
+            log::error!("Blocking error fetching stats: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Internal server error"
+            }))
+        }
+    }
+}
+
