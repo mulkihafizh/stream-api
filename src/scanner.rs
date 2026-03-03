@@ -30,12 +30,21 @@ pub fn scan_library(
             continue;
         }
 
-        let file_path_str = path.to_string_lossy().to_string();
+        let abs_path_str = path.to_string_lossy().to_string();
+
+        let base = std::path::Path::new(&config.music_library_path);
+        let file_path_str = match path.strip_prefix(base) {
+            Ok(rel) => rel.to_string_lossy().to_string(),
+            Err(_) => {
+                log::warn!("Track outside library root, skipping: {}", abs_path_str);
+                continue;
+            }
+        };
 
         let metadata = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
-                log::warn!("Cannot stat {}: {}", file_path_str, e);
+                log::warn!("Cannot stat {}: {}", abs_path_str, e);
                 continue;
             }
         };
@@ -60,7 +69,7 @@ pub fn scan_library(
         let tagged_file = match lofty::read_from_path(path) {
             Ok(f) => f,
             Err(e) => {
-                log::warn!("Failed to read tags from {}: {}", file_path_str, e);
+                log::warn!("Failed to read tags from {}: {}", abs_path_str, e);
                 continue;
             }
         };
@@ -119,7 +128,7 @@ pub fn scan_library(
                 cover_filename.as_deref(),
                 modified,
             ) {
-                log::warn!("Failed to upsert {}: {}", file_path_str, e);
+                log::warn!("Failed to upsert {}: {}", abs_path_str, e);
                 continue;
             }
         }

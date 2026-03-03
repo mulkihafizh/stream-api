@@ -135,14 +135,19 @@ pub async fn stream_file(
     config: web::Data<Config>,
     req: HttpRequest,
 ) -> actix_web::Result<HttpResponse> {
-    let relative_path = path.into_inner();
+    let raw_path = path.into_inner();
+    let relative_path = raw_path.replace('+', " ");
+    log::debug!("Stream request: raw='{}' resolved='{}'", raw_path, relative_path);
+
     let base = PathBuf::from(&config.music_library_path);
     let target = base.join(&relative_path);
 
     let canonical_base = std::fs::canonicalize(&base)
         .map_err(|_| actix_web::error::ErrorNotFound("Library path not found"))?;
-    let canonical_target = std::fs::canonicalize(&target)
-        .map_err(|_| actix_web::error::ErrorNotFound("File not found"))?;
+    let canonical_target = std::fs::canonicalize(&target).map_err(|e| {
+        log::warn!("File not found: {} (error: {})", target.display(), e);
+        actix_web::error::ErrorNotFound("File not found")
+    })?;
 
     if !canonical_target.starts_with(&canonical_base) {
         return Err(actix_web::error::ErrorForbidden("Access denied"));
@@ -196,6 +201,7 @@ pub async fn record_play(
                 "error": "Internal server error"
             }))
         }
+    }
 }
 
 pub async fn get_annual_stats(
