@@ -411,7 +411,7 @@ pub async fn stream_file(
     }
 
     // NamedFile handles Range requests (Accept-Ranges, 206, 416) automatically
-    let file = NamedFile::open(canonical_target)?;
+    let file = NamedFile::open_async(canonical_target).await?;
     Ok(file.into_response(&req))
 }
 
@@ -426,11 +426,11 @@ pub async fn serve_cover(
 ) -> actix_web::Result<HttpResponse> {
     let cover_path = PathBuf::from(&config.cover_cache_dir).join(filename.as_str());
 
-    if !cover_path.exists() {
-        return Err(actix_web::error::ErrorNotFound("Cover art not found"));
-    }
-
-    let file = NamedFile::open(cover_path)?;
+    let file = match NamedFile::open_async(&cover_path).await {
+        Ok(f) => f,
+        Err(_) => return Err(actix_web::error::ErrorNotFound("Cover art not found")),
+    };
+    
     Ok(file.into_response(&req))
 }
 
