@@ -1,14 +1,255 @@
 use crate::config::Config;
 use crate::db;
 use crate::models::{
-    AddTrackRequest, CreatePlaylistRequest, LibraryResponse, Playlist, PlaylistsResponse,
-    RecordPlayRequest,
+    AddTrackRequest, CreatePlaylistRequest, LibraryResponse, LyricLine, LyricsPayload,
+    LyricsResponse, Playlist, PlaylistsResponse, RecordPlayRequest, UnsyncedLyrics,
 };
 use actix_files::NamedFile;
 use actix_web::{web, HttpRequest, HttpResponse};
+use regex::Regex;
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+// ══════════════════════════════════════════════════════════
+//  B-5: Songs endpoints
+// ══════════════════════════════════════════════════════════
+
+pub async fn get_songs(db_handle: web::Data<Mutex<Connection>>) -> HttpResponse {
+    let db_handle = db_handle.clone();
+    let result = web::block(move || {
+        let conn = db_handle.lock().unwrap();
+        db::get_all_tracks(&conn)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(tracks)) => HttpResponse::Ok().json(LibraryResponse {
+            total: tracks.len(),
+            tracks,
+        }),
+        Ok(Err(e)) => {
+            log::error!("Database error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to retrieve songs"
+            }))
+        }
+        Err(e) => {
+            log::error!("Blocking error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Internal server error"
+            }))
+        }
+    }
+}
+
+pub async fn get_song_by_id(
+    db_handle: web::Data<Mutex<Connection>>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let track_id = path.into_inner();
+    let db_handle = db_handle.clone();
+
+    let result = web::block(move || {
+        let conn = db_handle.lock().unwrap();
+        db::get_track_by_id(&conn, &track_id)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(track))) => HttpResponse::Ok().json(track),
+        Ok(Ok(None)) => HttpResponse::NotFound().json(serde_json::json!({
+            "error": "Song not found"
+        })),
+        Ok(Err(e)) => {
+            log::error!("Database error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to retrieve song"
+            }))
+        }
+        Err(e) => {
+            log::error!("Blocking error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Internal server error"
+            }))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════
+//  B-5: Albums endpoints
+// ══════════════════════════════════════════════════════════
+
+pub async fn get_albums(db_handle: web::Data<Mutex<Connection>>) -> HttpResponse {
+    let db_handle = db_handle.clone();
+    let result = web::block(move || {
+        let conn = db_handle.lock().unwrap();
+        db::get_all_albums(&conn)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(albums)) => HttpResponse::Ok().json(serde_json::json!({
+            "total": albums.len(),
+            "albums": albums
+        })),
+        Ok(Err(e)) => {
+            log::error!("Database error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to retrieve albums"
+            }))
+        }
+        Err(e) => {
+            log::error!("Blocking error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Internal server error"
+            }))
+        }
+    }
+}
+
+pub async fn get_album_by_id(
+    db_handle: web::Data<Mutex<Connection>>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let album_id = path.into_inner();
+    let db_handle = db_handle.clone();
+
+    let result = web::block(move || {
+        let conn = db_handle.lock().unwrap();
+        db::get_album_detail(&conn, &album_id)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(album))) => HttpResponse::Ok().json(album),
+        Ok(Ok(None)) => HttpResponse::NotFound().json(serde_json::json!({
+            "error": "Album not found"
+        })),
+        Ok(Err(e)) => {
+            log::error!("Database error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to retrieve album"
+            }))
+        }
+        Err(e) => {
+            log::error!("Blocking error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Internal server error"
+            }))
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════
+//  B-2: Lyrics endpoint
+// ══════════════════════════════════════════════════════════
+
+pub async fn get_lyrics(
+    db_handle: web::Data<Mutex<Connection>>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let song_id = path.into_inner();
+    let db_handle = db_handle.clone();
+
+    let result = web::block(move || {
+        let conn = db_handle.lock().unwrap();
+        db::get_track_lyrics(&conn, &song_id)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some((id, lyrics_type, lyrics_raw, kana_text, romaji_text)))) => {
+            let payload = match lyrics_type.as_deref() {
+                Some("synced") => {
+                    let lines =
+                        parse_lrc_lines(&lyrics_raw.unwrap_or_default(), kana_text, romaji_text);
+                    LyricsPayload::Synced { lyrics: lines }
+                }
+                Some("unsynced") => {
+                    let raw = lyrics_raw.unwrap_or_default();
+                    LyricsPayload::Unsynced {
+                        lyrics: UnsyncedLyrics {
+                            text: raw,
+                            kana: kana_text,
+                            romaji: romaji_text,
+                        },
+                    }
+                }
+                _ => LyricsPayload::None { lyrics: None },
+            };
+
+            HttpResponse::Ok().json(LyricsResponse {
+                song_id: id,
+                payload,
+            })
+        }
+        Ok(Ok(None)) => HttpResponse::NotFound().json(serde_json::json!({
+            "error": "Song not found"
+        })),
+        Ok(Err(e)) => {
+            log::error!("Database error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to retrieve lyrics"
+            }))
+        }
+        Err(e) => {
+            log::error!("Blocking error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Internal server error"
+            }))
+        }
+    }
+}
+
+/// Parse LRC-format lyrics into structured LyricLine objects.
+/// Also merges kana/romaji from parallel LRC data if available.
+fn parse_lrc_lines(
+    raw: &str,
+    kana_raw: Option<String>,
+    romaji_raw: Option<String>,
+) -> Vec<LyricLine> {
+    let lrc_regex = Regex::new(r"\[(\d{2}):(\d{2})\.(\d{2})\](.*)").unwrap();
+
+    let kana_lines: Vec<&str> = kana_raw.as_deref().map_or(Vec::new(), |k| k.lines().collect());
+    let romaji_lines: Vec<&str> = romaji_raw
+        .as_deref()
+        .map_or(Vec::new(), |r| r.lines().collect());
+
+    let mut result = Vec::new();
+
+    for (i, line) in raw.lines().enumerate() {
+        if let Some(caps) = lrc_regex.captures(line) {
+            let mm: u64 = caps[1].parse().unwrap_or(0);
+            let ss: u64 = caps[2].parse().unwrap_or(0);
+            let cs: u64 = caps[3].parse().unwrap_or(0);
+            let time_ms = (mm * 60 + ss) * 1000 + cs * 10;
+            let text = caps[4].trim().to_string();
+
+            // Extract kana/romaji from parallel lines
+            let kana = kana_lines.get(i).and_then(|kl| {
+                lrc_regex.captures(kl).map(|c| c[4].trim().to_string())
+            }).filter(|s| !s.is_empty());
+
+            let romaji = romaji_lines.get(i).and_then(|rl| {
+                lrc_regex.captures(rl).map(|c| c[4].trim().to_string())
+            }).filter(|s| !s.is_empty());
+
+            result.push(LyricLine {
+                time_ms,
+                text,
+                kana,
+                romaji,
+            });
+        }
+    }
+
+    result
+}
+
+// ══════════════════════════════════════════════════════════
+//  Existing endpoints (preserved, updated with new Track fields)
+// ══════════════════════════════════════════════════════════
 
 pub async fn get_library(db_handle: web::Data<Mutex<Connection>>) -> HttpResponse {
     let db_handle = db_handle.clone();
@@ -130,6 +371,10 @@ pub async fn add_track_to_playlist(
     }
 }
 
+// ══════════════════════════════════════════════════════════
+//  B-4: Stream file (NamedFile handles Range natively)
+// ══════════════════════════════════════════════════════════
+
 pub async fn stream_file(
     path: web::Path<String>,
     config: web::Data<Config>,
@@ -137,25 +382,42 @@ pub async fn stream_file(
 ) -> actix_web::Result<HttpResponse> {
     let raw_path = path.into_inner();
     let relative_path = raw_path.replace('+', " ");
-    log::debug!("Stream request: raw='{}' resolved='{}'", raw_path, relative_path);
+    log::debug!(
+        "Stream request: raw='{}' resolved='{}'",
+        raw_path,
+        relative_path
+    );
 
     let base = PathBuf::from(&config.music_library_path);
     let target = base.join(&relative_path);
 
-    let canonical_base = std::fs::canonicalize(&base)
-        .map_err(|_| actix_web::error::ErrorNotFound("Library path not found"))?;
-    let canonical_target = std::fs::canonicalize(&target).map_err(|e| {
-        log::warn!("File not found: {} (error: {})", target.display(), e);
+    // Use web::block for fs operations to avoid blocking the Actix event loop
+    let canonical = web::block(move || -> Result<(PathBuf, PathBuf), std::io::Error> {
+        let cb = std::fs::canonicalize(&base)?;
+        let ct = std::fs::canonicalize(&target)?;
+        Ok((cb, ct))
+    })
+    .await
+    .map_err(|_| actix_web::error::ErrorInternalServerError("IO error"))?
+    .map_err(|e| {
+        log::warn!("File not found: {}", e);
         actix_web::error::ErrorNotFound("File not found")
     })?;
+
+    let (canonical_base, canonical_target) = canonical;
 
     if !canonical_target.starts_with(&canonical_base) {
         return Err(actix_web::error::ErrorForbidden("Access denied"));
     }
 
+    // NamedFile handles Range requests (Accept-Ranges, 206, 416) automatically
     let file = NamedFile::open(canonical_target)?;
     Ok(file.into_response(&req))
 }
+
+// ══════════════════════════════════════════════════════════
+//  B-1: Serve cover art
+// ══════════════════════════════════════════════════════════
 
 pub async fn serve_cover(
     filename: web::Path<String>,
@@ -171,6 +433,10 @@ pub async fn serve_cover(
     let file = NamedFile::open(cover_path)?;
     Ok(file.into_response(&req))
 }
+
+// ══════════════════════════════════════════════════════════
+//  Play history + Stats (unchanged logic, new Track fields)
+// ══════════════════════════════════════════════════════════
 
 pub async fn record_play(
     db_handle: web::Data<Mutex<Connection>>,
@@ -233,4 +499,3 @@ pub async fn get_annual_stats(
         }
     }
 }
-

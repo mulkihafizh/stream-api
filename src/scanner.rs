@@ -1,12 +1,35 @@
 use crate::config::Config;
 use crate::db;
-use rusqlite::Connection;
+use crate::romaji;
 use lofty::file::{AudioFile, TaggedFileExt};
+use regex::Regex;
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+/// Compute an album deduplication hash: sha256(normalize(artist) + "|" + normalize(album)),
+/// truncated to 16 hex chars.
+pub fn compute_album_hash(artist: &str, album: &str) -> String {
+    let normalized = format!(
+        "{}|{}",
+        artist.trim().to_lowercase(),
+        album.trim().to_lowercase()
+    );
+    let hash = Sha256::digest(normalized.as_bytes());
+    hex::encode(&hash[..8]) // 8 bytes = 16 hex chars
+}
+
+/// Helper to encode bytes as hex (since we don't have the `hex` crate,
+/// we use a manual implementation).
+mod hex {
+    pub fn encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+}
 
 pub fn scan_library(
     config: &Config,
@@ -15,6 +38,23 @@ pub fn scan_library(
     log::info!("Starting library scan: {}", config.music_library_path);
     let mut count: usize = 0;
 
+    // Build lindera tokenizer once for Romaji processing
+    let tokenizer = match romaji::build_tokenizer() {
+        Ok(t) => {
+            log::info!("Lindera tokenizer initialized for Romaji conversion");
+            Some(t)
+        }
+        Err(e) => {
+            log::warn!("Failed to initialize lindera tokenizer (Romaji disabled): {}", e);
+            None
+        }
+    };
+
+    // Compile LRC regex once
+    let lrc_regex = Regex::new(r"\[\d{2}:\d{2}\.\d{2}\]").unwrap();
+
+    let supported_extensions = ["flac", "mp3", "m4a", "aac", "ogg", "opus", "wav"];
+
     for entry in WalkDir::new(&config.music_library_path)
         .follow_links(true)
         .into_iter()
@@ -22,11 +62,12 @@ pub fn scan_library(
     {
         let path = entry.path();
 
-        let is_flac = path
-            .extension()
-            .map_or(false, |ext| ext.to_ascii_lowercase() == "flac");
+        let is_audio = path.extension().map_or(false, |ext| {
+            let ext_lower = ext.to_ascii_lowercase();
+            supported_extensions.iter().any(|e| ext_lower == *e)
+        });
 
-        if !is_flac || !path.is_file() {
+        if !is_audio || !path.is_file() {
             continue;
         }
 
@@ -111,7 +152,21 @@ pub fn scan_library(
 
         let track_id = Uuid::new_v4().to_string();
 
-        let cover_filename = extract_cover_art(tag, &config.cover_cache_dir, &track_id);
+        // --- Cover art extraction with album-level deduplication ---
+        let album_hash = compute_album_hash(&artist, &album);
+        let cover_filename = extract_cover_art_dedup(tag, &config.cover_cache_dir, &album_hash);
+
+        // --- Lyrics extraction ---
+        let (lyrics_type, lyrics_raw) = extract_lyrics(tag, &lrc_regex);
+
+        // --- Romaji processing ---
+        let (kana_text, romaji_text) = if let (Some(ref raw), Some(ref tokenizer)) =
+            (&lyrics_raw, &tokenizer)
+        {
+            process_romaji(tokenizer, raw, lyrics_type.as_deref())
+        } else {
+            (None, None)
+        };
 
         {
             let conn = db_handle.lock().unwrap();
@@ -127,6 +182,11 @@ pub fn scan_library(
                 &file_path_str,
                 cover_filename.as_deref(),
                 modified,
+                Some(&album_hash),
+                lyrics_type.as_deref(),
+                lyrics_raw.as_deref(),
+                kana_text.as_deref(),
+                romaji_text.as_deref(),
             ) {
                 log::warn!("Failed to upsert {}: {}", abs_path_str, e);
                 continue;
@@ -143,11 +203,21 @@ pub fn scan_library(
     Ok(count)
 }
 
-fn extract_cover_art(
+/// Extract cover art with album-level deduplication.
+/// Uses album_hash as filename — skips if the file already exists.
+fn extract_cover_art_dedup(
     tag: Option<&lofty::tag::Tag>,
     cache_dir: &str,
-    track_id: &str,
+    album_hash: &str,
 ) -> Option<String> {
+    let filename = format!("{}.jpg", album_hash);
+    let output_path = Path::new(cache_dir).join(&filename);
+
+    // Skip if cover already extracted for this album
+    if output_path.exists() {
+        return Some(filename);
+    }
+
     let tag = tag?;
     let pictures = tag.pictures();
 
@@ -158,20 +228,112 @@ fn extract_cover_art(
 
     let picture = cover?;
 
-    let filename = format!("{}.jpg", track_id);
-    let output_path = Path::new(cache_dir).join(&filename);
-
     match image::load_from_memory(picture.data()) {
         Ok(img) => match img.save(&output_path) {
-            Ok(_) => Some(filename),
+            Ok(_) => {
+                log::debug!("Saved cover art: {}", output_path.display());
+                Some(filename)
+            }
             Err(e) => {
                 log::warn!("Failed to save cover art {}: {}", output_path.display(), e);
                 None
             }
         },
         Err(e) => {
-            log::warn!("Failed to decode cover art for track {}: {}", track_id, e);
+            log::warn!(
+                "Failed to decode cover art for album hash {}: {}",
+                album_hash,
+                e
+            );
             None
+        }
+    }
+}
+
+/// Extract lyrics from audio tags.
+/// Looks for LYRICS or UNSYNCEDLYRICS Vorbis comments.
+/// Returns (lyrics_type, lyrics_raw).
+fn extract_lyrics(
+    tag: Option<&lofty::tag::Tag>,
+    lrc_regex: &Regex,
+) -> (Option<String>, Option<String>) {
+    let tag = match tag {
+        Some(t) => t,
+        None => return (None, None),
+    };
+
+    // Try LYRICS first, then UNSYNCEDLYRICS
+    let lyrics_text = tag
+        .get_string(&lofty::tag::ItemKey::Lyrics)
+        .or_else(|| {
+            // Try UNSYNCEDLYRICS via custom key
+            tag.get_string(&lofty::tag::ItemKey::Unknown("UNSYNCEDLYRICS".to_string()))
+        });
+
+    let raw = match lyrics_text {
+        Some(text) if !text.trim().is_empty() => text.to_string(),
+        _ => return (None, None),
+    };
+
+    // Detect synced vs unsynced
+    let lyrics_type = if raw.starts_with('[') && lrc_regex.is_match(&raw) {
+        "synced".to_string()
+    } else {
+        "unsynced".to_string()
+    };
+
+    (Some(lyrics_type), Some(raw))
+}
+
+/// Process romaji for lyrics using lindera tokenizer.
+/// For synced lyrics, processes each line independently.
+/// For unsynced lyrics, processes the full text.
+fn process_romaji(
+    tokenizer: &lindera::tokenizer::Tokenizer,
+    lyrics_raw: &str,
+    lyrics_type: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    // Check if any Japanese exists
+    if !romaji::contains_japanese(lyrics_raw) {
+        return (None, None);
+    }
+
+    match lyrics_type {
+        Some("synced") => {
+            // For synced (LRC), process each line separately
+            // Store kana/romaji as parallel LRC-like lines separated by newlines
+            let lrc_line_regex = Regex::new(r"\[(\d{2}):(\d{2})\.(\d{2})\](.*)").unwrap();
+            let mut kana_lines = Vec::new();
+            let mut romaji_lines = Vec::new();
+
+            for line in lyrics_raw.lines() {
+                if let Some(caps) = lrc_line_regex.captures(line) {
+                    let timestamp = format!(
+                        "[{}:{}.{}]",
+                        &caps[1], &caps[2], &caps[3]
+                    );
+                    let text = caps[4].trim();
+
+                    if romaji::contains_japanese(text) {
+                        let (kana, rom) = romaji::to_kana_and_romaji(tokenizer, text);
+                        kana_lines.push(format!("{}{}", timestamp, kana));
+                        romaji_lines.push(format!("{}{}", timestamp, rom));
+                    } else {
+                        kana_lines.push(line.to_string());
+                        romaji_lines.push(line.to_string());
+                    }
+                } else {
+                    kana_lines.push(line.to_string());
+                    romaji_lines.push(line.to_string());
+                }
+            }
+
+            (Some(kana_lines.join("\n")), Some(romaji_lines.join("\n")))
+        }
+        Some("unsynced") | _ => {
+            // For unsynced, process full text
+            let (kana, rom) = romaji::to_kana_and_romaji(tokenizer, lyrics_raw);
+            (Some(kana), Some(rom))
         }
     }
 }

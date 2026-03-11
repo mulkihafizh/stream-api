@@ -1,4 +1,4 @@
-use crate::models::{PlaylistDetail, Track};
+use crate::models::{Album, AlbumDetail, PlaylistDetail, Track};
 use rusqlite::{params, Connection, Result};
 
 pub fn initialize_db(path: &str) -> Result<Connection> {
@@ -51,7 +51,39 @@ pub fn initialize_db(path: &str) -> Result<Connection> {
          CREATE INDEX IF NOT EXISTS idx_play_history_track_id ON play_history(track_id);",
     )?;
 
+    // --- Migration: add lyrics and cover hash columns ---
+    run_migrations(&conn)?;
+
     Ok(conn)
+}
+
+fn run_migrations(conn: &Connection) -> Result<()> {
+    // Check if lyrics_type column exists on tracks
+    let has_lyrics_type = conn
+        .prepare("SELECT lyrics_type FROM tracks LIMIT 0")
+        .is_ok();
+
+    if !has_lyrics_type {
+        log::info!("Running migration: adding lyrics and romaji columns to tracks");
+        conn.execute_batch(
+            "ALTER TABLE tracks ADD COLUMN lyrics_type TEXT;
+             ALTER TABLE tracks ADD COLUMN lyrics_raw TEXT;
+             ALTER TABLE tracks ADD COLUMN kana_text TEXT;
+             ALTER TABLE tracks ADD COLUMN romaji_text TEXT;",
+        )?;
+    }
+
+    // Check if cover_art_hash column exists on tracks
+    let has_cover_hash = conn
+        .prepare("SELECT cover_art_hash FROM tracks LIMIT 0")
+        .is_ok();
+
+    if !has_cover_hash {
+        log::info!("Running migration: adding cover_art_hash column to tracks");
+        conn.execute_batch("ALTER TABLE tracks ADD COLUMN cover_art_hash TEXT;")?;
+    }
+
+    Ok(())
 }
 
 pub fn get_track_modified_time(conn: &Connection, file_path: &str) -> Result<Option<i64>> {
@@ -76,10 +108,17 @@ pub fn upsert_track(
     file_path: &str,
     cover_art_filename: Option<&str>,
     file_modified: i64,
+    cover_art_hash: Option<&str>,
+    lyrics_type: Option<&str>,
+    lyrics_raw: Option<&str>,
+    kana_text: Option<&str>,
+    romaji_text: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO tracks (id, title, artist, album, sample_rate, bit_depth, duration_seconds, file_path, cover_art_filename, file_modified)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO tracks (id, title, artist, album, sample_rate, bit_depth, duration_seconds,
+                             file_path, cover_art_filename, file_modified, cover_art_hash,
+                             lyrics_type, lyrics_raw, kana_text, romaji_text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(file_path) DO UPDATE SET
              title = excluded.title,
              artist = excluded.artist,
@@ -88,7 +127,12 @@ pub fn upsert_track(
              bit_depth = excluded.bit_depth,
              duration_seconds = excluded.duration_seconds,
              cover_art_filename = excluded.cover_art_filename,
-             file_modified = excluded.file_modified",
+             file_modified = excluded.file_modified,
+             cover_art_hash = excluded.cover_art_hash,
+             lyrics_type = excluded.lyrics_type,
+             lyrics_raw = excluded.lyrics_raw,
+             kana_text = excluded.kana_text,
+             romaji_text = excluded.romaji_text",
         params![
             id,
             title,
@@ -99,37 +143,164 @@ pub fn upsert_track(
             duration_seconds,
             file_path,
             cover_art_filename,
-            file_modified
+            file_modified,
+            cover_art_hash,
+            lyrics_type,
+            lyrics_raw,
+            kana_text,
+            romaji_text
         ],
     )?;
     Ok(())
 }
 
+fn row_to_track(row: &rusqlite::Row) -> rusqlite::Result<Track> {
+    let cover_hash: Option<String> = row.get("cover_art_hash")?;
+    let cover_filename: Option<String> = row.get("cover_art_filename")?;
+    // Prefer hash-based URL, fall back to filename-based
+    let cover_art_url = cover_hash
+        .as_ref()
+        .map(|h| format!("/api/covers/{}.jpg", h))
+        .or_else(|| cover_filename.map(|f| format!("/api/covers/{}", f)));
+
+    let id: String = row.get("id")?;
+    let file_path: String = row.get("file_path")?;
+    let stream_url = format!(
+        "/api/stream/{}",
+        file_path.replace('\\', "/")
+    );
+
+    Ok(Track {
+        id,
+        title: row.get("title")?,
+        artist: row.get("artist")?,
+        album: row.get("album")?,
+        sample_rate: row.get("sample_rate")?,
+        bit_depth: row.get("bit_depth")?,
+        duration_seconds: row.get("duration_seconds")?,
+        file_path,
+        cover_art_url,
+        stream_url,
+    })
+}
+
 pub fn get_all_tracks(conn: &Connection) -> Result<Vec<Track>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, artist, album, sample_rate, bit_depth, duration_seconds, file_path, cover_art_filename
+        "SELECT id, title, artist, album, sample_rate, bit_depth, duration_seconds,
+                file_path, cover_art_filename, cover_art_hash
          FROM tracks ORDER BY artist, album, title",
     )?;
 
     let tracks = stmt
+        .query_map([], |row| row_to_track(row))?
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(tracks)
+}
+
+pub fn get_track_by_id(conn: &Connection, track_id: &str) -> Result<Option<Track>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, artist, album, sample_rate, bit_depth, duration_seconds,
+                file_path, cover_art_filename, cover_art_hash
+         FROM tracks WHERE id = ?1",
+    )?;
+
+    let mut rows = stmt.query(params![track_id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row_to_track(row)?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn get_track_lyrics(
+    conn: &Connection,
+    track_id: &str,
+) -> Result<Option<(String, Option<String>, Option<String>, Option<String>, Option<String>)>> {
+    // Returns: (id, lyrics_type, lyrics_raw, kana_text, romaji_text)
+    let mut stmt = conn.prepare(
+        "SELECT id, lyrics_type, lyrics_raw, kana_text, romaji_text
+         FROM tracks WHERE id = ?1",
+    )?;
+
+    let mut rows = stmt.query(params![track_id])?;
+    if let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let lyrics_type: Option<String> = row.get(1)?;
+        let lyrics_raw: Option<String> = row.get(2)?;
+        let kana_text: Option<String> = row.get(3)?;
+        let romaji_text: Option<String> = row.get(4)?;
+        Ok(Some((id, lyrics_type, lyrics_raw, kana_text, romaji_text)))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn get_all_albums(conn: &Connection) -> Result<Vec<Album>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT album, artist, cover_art_hash, cover_art_filename,
+                COUNT(*) as track_count
+         FROM tracks
+         GROUP BY album, artist
+         ORDER BY artist, album",
+    )?;
+
+    let albums = stmt
         .query_map([], |row| {
-            let cover_filename: Option<String> = row.get(8)?;
-            let cover_art_url = cover_filename.map(|f| format!("/api/covers/{}", f));
-            Ok(Track {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                artist: row.get(2)?,
-                album: row.get(3)?,
-                sample_rate: row.get(4)?,
-                bit_depth: row.get(5)?,
-                duration_seconds: row.get(6)?,
-                file_path: row.get(7)?,
-                cover_art_url,
+            let album: String = row.get(0)?;
+            let artist: String = row.get(1)?;
+            let cover_hash: Option<String> = row.get(2)?;
+            let cover_filename: Option<String> = row.get(3)?;
+            let track_count: usize = row.get(4)?;
+
+            let cover_url = cover_hash
+                .as_ref()
+                .map(|h| format!("/api/covers/{}.jpg", h))
+                .or_else(|| cover_filename.map(|f| format!("/api/covers/{}", f)));
+
+            // Generate a stable "id" from artist|album for URL purposes
+            let id = crate::scanner::compute_album_hash(&artist, &album);
+
+            Ok(Album {
+                id,
+                name: album,
+                artist,
+                cover_url,
+                track_count,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(tracks)
+    Ok(albums)
+}
+
+pub fn get_album_detail(conn: &Connection, album_hash: &str) -> Result<Option<AlbumDetail>> {
+    // Find tracks matching this album hash
+    let mut stmt = conn.prepare(
+        "SELECT id, title, artist, album, sample_rate, bit_depth, duration_seconds,
+                file_path, cover_art_filename, cover_art_hash
+         FROM tracks WHERE cover_art_hash = ?1
+         ORDER BY title",
+    )?;
+
+    let tracks: Vec<Track> = stmt
+        .query_map(params![album_hash], |row| row_to_track(row))?
+        .collect::<Result<Vec<_>>>()?;
+
+    if tracks.is_empty() {
+        return Ok(None);
+    }
+
+    let first = &tracks[0];
+    let cover_url = first.cover_art_url.clone();
+
+    Ok(Some(AlbumDetail {
+        id: album_hash.to_string(),
+        name: first.album.clone(),
+        artist: first.artist.clone(),
+        cover_url,
+        tracks,
+    }))
 }
 
 pub fn get_playlists_with_tracks(conn: &Connection) -> Result<Vec<PlaylistDetail>> {
@@ -140,7 +311,7 @@ pub fn get_playlists_with_tracks(conn: &Connection) -> Result<Vec<PlaylistDetail
 
     let mut track_stmt = conn.prepare(
         "SELECT t.id, t.title, t.artist, t.album, t.sample_rate, t.bit_depth,
-                t.duration_seconds, t.file_path, t.cover_art_filename
+                t.duration_seconds, t.file_path, t.cover_art_filename, t.cover_art_hash
          FROM playlist_tracks pt
          JOIN tracks t ON t.id = pt.track_id
          WHERE pt.playlist_id = ?1
@@ -150,21 +321,7 @@ pub fn get_playlists_with_tracks(conn: &Connection) -> Result<Vec<PlaylistDetail
     let mut result = Vec::new();
     for (pid, pname) in playlists {
         let tracks = track_stmt
-            .query_map(params![pid], |row| {
-                let cover_filename: Option<String> = row.get(8)?;
-                let cover_art_url = cover_filename.map(|f| format!("/api/covers/{}", f));
-                Ok(Track {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    artist: row.get(2)?,
-                    album: row.get(3)?,
-                    sample_rate: row.get(4)?,
-                    bit_depth: row.get(5)?,
-                    duration_seconds: row.get(6)?,
-                    file_path: row.get(7)?,
-                    cover_art_url,
-                })
-            })?
+            .query_map(params![pid], |row| row_to_track(row))?
             .collect::<Result<Vec<_>>>()?;
 
         result.push(PlaylistDetail {
@@ -285,7 +442,7 @@ pub fn get_annual_stats(
     let mut top_tracks = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT t.id, t.title, t.artist, t.album, t.sample_rate, t.bit_depth,
-                t.duration_seconds, t.file_path, t.cover_art_filename,
+                t.duration_seconds, t.file_path, t.cover_art_filename, t.cover_art_hash,
                 COUNT(p.id) as play_count, SUM(p.duration_listened) as total_duration
          FROM play_history p
          JOIN tracks t ON t.id = p.track_id
@@ -295,23 +452,11 @@ pub fn get_annual_stats(
          LIMIT 10",
     )?;
     let tracks_iter = stmt.query_map(params![start_ts, end_ts], |row| {
-        let cover_filename: Option<String> = row.get(8)?;
-        let cover_art_url = cover_filename.map(|f| format!("/api/covers/{}", f));
-        let track = Track {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            artist: row.get(2)?,
-            album: row.get(3)?,
-            sample_rate: row.get(4)?,
-            bit_depth: row.get(5)?,
-            duration_seconds: row.get(6)?,
-            file_path: row.get(7)?,
-            cover_art_url,
-        };
+        let track = row_to_track(row)?;
         Ok(TopTrack {
             track,
-            play_count: row.get(9)?,
-            total_duration: row.get(10)?,
+            play_count: row.get(10)?,
+            total_duration: row.get(11)?,
         })
     })?;
     for track in tracks_iter {
